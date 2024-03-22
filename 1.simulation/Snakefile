@@ -151,7 +151,9 @@ rule all:
         ],
         # Full summary
         "data/full_summary.tsv",
-        "data/full_gcov.tsv"
+        "data/full_gcov.tsv",
+        "data/full_summary.tsv.zst",
+        "data/full_gcov.tsv.zst",
 
 
 ## filter_genotypes: Build a set of genotypes for this analysis.
@@ -454,3 +456,12 @@ rule gather_gcov:
             full_df.append(df)
         full_df = pl.concat(full_df, how="vertical_relaxed")
         full_df.write_csv(output[0], separator="\t")
+
+## compress: Compress output files to save space and allow version control.
+rule compress:
+    input:
+      "{file}"
+    output:
+      "{file}.zst"
+    shell:
+      "zstd -19 {input} -o {output}"
