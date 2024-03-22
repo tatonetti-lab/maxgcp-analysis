@@ -1,0 +1,215 @@
+"""
+Real data analysis.
+
+This analysis compares the sensitivity, specificity, and AUROC of MaxGCP GWAS
+versus with naive phenotype GWAS, using real data. To enable this analysis, we
+will downsample our cohort of ~350,000 to 20,000, ensuring that even a
+maximally powerful phenotyping method will not be powered to detect genetic
+associations that would have escaped the full-size naive phenotyping method's
+GWAS.
+
+Put differently, compared to the 20,000 sample cohort, the full-size cohort's
+GWAS results are so much more powerful that they can reasonably be used as
+ground truth, for both positives and negatives. This lets us evaluate MaxGCP
+in real data, where gold standards are not available.
+
+General steps:
+
+1. Acquire phenotype data
+2. Locate genotype data
+3. Create a subsampled cohort (with a pre-defined random seed, in case we need
+     to reproduce or repeat the results)
+4. Use Haseman-Elston regression to estimate heritability and genetic
+     correlation among all phenotypes
+5. Build the genetic covariance matrix
+6. Build the phenotypic covariance matrix
+7. Compute MaxGCP
+8. GWAS on naive phenotypes and MaxGCP phenotypes in the reduced dataset
+9. GWAS on the naive phenotypes in the full dataset
+10. Compare the results
+"""
+
+import itertools
+import pathlib
+
+import pandas as pd
+import polars as pl
+
+root = pathlib.Path(".")
+pheno_path = root.joinpath("data/pheno/pheno_jan2024.tsv")
+covar_path = root.joinpath("data/pheno/covar.tsv")
+geno_path = (
+    "/data1/home/mnz2108/data_resources/ukbiobank/hapmap3_genotypes/"
+    "hapmap3_variants_white_british"
+)
+
+phenotype_names = pd.read_csv(pheno_path, sep="\t", nrows=0).columns[2:]
+phenotype_idx = [i for i, name in enumerate(phenotype_names)
+                 if name.startswith("b_")]
+pheno_idx_pairs = list(itertools.combinations(phenotype_idx, 2))
+
+
+rule all:
+  input:
+    pheno_path,
+    covar_path,
+    # multiext(geno_path, ".pgen", ".psam", ".pvar"),
+    "data/pheno/pheno_sub_0.tsv",
+    "data/pheno/covar_sub_0.tsv",
+    "data/pheno/samples_sub_0.tsv",
+    multiext("data/geno/geno_sub_0", ".bed", ".bim", ".fam"),
+    multiext("data/grm/grm_sub_0.grm", ".bin", ".id", ".N.bin"),
+    expand("data/h2/h2_sub_0_{i}.HEreg", i=phenotype_idx),
+    # [f"data/rg/rg_sub_0_{i}_{j}.HEreg" for i, j in pheno_idx_pairs],
+    # "data/pcov/pcov_sub_0.tsv",
+    # "data/gcov/gcov_sub_0.tsv",
+
+
+rule subsample_cohort:
+  input:
+    pheno = pheno_path,
+    covar = covar_path,
+  output:
+    pheno = "data/pheno/pheno_sub_{seed}.tsv",
+    covar = "data/pheno/covar_sub_{seed}.tsv",
+    samples = "data/pheno/samples_sub_{seed}.tsv",
+  run:
+    pheno_df = pl.read_csv(input.pheno, separator="\t")
+    covar_df = pl.read_csv(input.covar, separator="\t")
+
+    subsampled_pheno_df = pheno_df.sample(n=20_000, with_replacement=False,
+                                          seed=int(wildcards.seed))
+
+    subsampled_covar_df = (
+        covar_df
+        .join(subsampled_pheno_df[["#FID", "IID"]], on=["#FID", "IID"])
+    )
+
+    subsampled_pheno_df.write_csv(output.pheno, separator="\t")
+    subsampled_covar_df.write_csv(output.covar, separator="\t")
+    subsampled_pheno_df[["#FID", "IID"]].write_csv(output.samples, separator="\t")
+
+
+rule subsample_geno:
+  input:
+    samples = "data/pheno/samples_sub_{seed}.tsv",
+    geno = multiext(geno_path, ".pgen", ".psam", ".pvar"),
+  output:
+    multiext("data/geno/geno_sub_{seed}", ".bed", ".bim", ".fam"),
+  params:
+    output_prefix = "data/geno/geno_sub_{seed}",
+  shell:
+    """
+    plink2 --pfile {geno_path} --keep {input.samples} --make-bed \
+      --out {params.output_prefix}
+    """
+
+rule make_grm:
+  input:
+    geno = multiext("data/geno/geno_sub_{seed}", ".bed", ".bim", ".fam"),
+  output:
+    multiext("data/grm/grm_sub_{seed}", ".grm.bin", ".grm.id", ".grm.N.bin"),
+  params:
+    input_prefix = "data/geno/geno_sub_{seed}",
+    output_prefix = "data/grm/grm_sub_{seed}",
+  shell:
+    """
+    gcta --bfile {params.input_prefix} --make-grm --out {params.output_prefix}
+    """
+
+rule haseman_elston:
+  input:
+    pheno = "data/pheno/pheno_sub_{seed}.tsv",
+    covar = "data/pheno/covar_sub_{seed}.tsv",
+    grm = multiext("data/grm/grm_sub_{seed}.grm", ".bin", ".id", ".N.bin"),
+  output:
+    "data/h2/h2_sub_{seed}_{i}.HEreg",
+  params:
+    grm_prefix = "data/grm/grm_sub_{seed}",
+    output_prefix = "data/h2/h2_sub_{seed}_{i}",
+  threads: 1
+  shell:
+    """
+    gcta --HEreg --grm {params.grm_prefix} --pheno {input.pheno} \
+      --mpheno {wildcards.i} --qcovar {input.covar} \
+      --out {params.output_prefix}
+    """
+
+rule collect_successful_h2:
+  input:
+    collect("data/h2/h2_sub_{{seed}}_{i}.HEreg", i=phenotype_idx),
+  output:
+    "data/h2/h2_sub_{seed}_successful.txt",
+  run:
+    ofile = open(output[0], "w")
+    for path in input:
+      with open(path) as file:
+        lines = file.readlines()
+
+      for line in lines:
+        if line.startswith("V(G)/Vp"):
+          h2 = line.lstrip("V(G)/Vp").strip().split(" ")[0]
+          if h2 == "nan" or h2 == "-nan" or h2.startswith("-"):
+            continue
+
+          i = path.split("_")[-1].split(".")[0]
+          ofile.write(f"{i}\n")
+
+    ofile.close()
+
+
+rule haseman_elston_rg:
+  input:
+    phenos = "data/pheno/pheno_sub_{seed}.tsv",
+    covar = "data/pheno/covar_sub_{seed}.tsv",
+    grm = multiext("data/grm/grm_sub_{seed}.grm", ".bin", ".id", ".N.bin"),
+  output:
+    "data/rg/rg_sub_{seed}_{i}_{j}.HEreg",
+  params:
+    grm_prefix = "data/grm/grm_sub_{seed}",
+    output_prefix = "data/rg/rg_sub_{seed}_{i}_{j}",
+  threads: 1
+  shell:
+    """
+    gcta --HEreg-bivar {wildcards.i} {wildcards.j} --grm {params.grm_prefix} \
+      --pheno {input.phenos} --qcovar {input.covar} \
+      --out {params.output_prefix}
+    """
+
+rule compute_phenotypic_correlation:
+  input:
+    "data/pheno/pheno_sub_{seed}.tsv",
+  output:
+    "data/pcov/pcov_sub_{seed}.tsv",
+  run:
+    (
+        pl.read_csv(input[0], separator="\t")
+        .select("^b_.+$")
+        .to_pandas()
+        .cov()
+        .to_csv(output[0], sep="\t")
+    )
+
+
+def make_rg_to_compute(wildcards):
+    with open(f"data/h2/h2_sub_{wildcards.seed}_successful.txt") as file:
+        successful_h2 = [int(line.strip()) for line in file.readlines()]
+
+    return [
+        f"data/rg/rg_sub_{wildcards.seed}_{i}_{j}.HEreg"
+        for i, j in itertools.combinations(successful_h2, 2)
+    ]
+
+rule compute_genetic_correlation:
+  input:
+    "data/h2/h2_sub_{seed}_successful.txt",
+    make_rg_to_compute,
+  output:
+    "data/gcov/gcov_sub_{seed}.tsv",
+  run:
+    (
+        pl.read_csv(input[0], separator="\t")
+        .select("GENETIC_CORR")
+        .to_pandas()
+        .to_csv(output[0], sep="\t")
+    )
