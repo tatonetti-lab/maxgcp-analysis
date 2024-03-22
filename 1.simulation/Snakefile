@@ -1,0 +1,456 @@
+"""Demonstrate the efficacy of MaxGCP in simulated data.
+
+[PhenotypeSimulator](https://hannahvmeyer.github.io/PhenotypeSimulator) offers
+a variety of tunable parameters for simluating correlated phenotypes. In this
+analysis, we perform simulations across a range of values for every relevant
+simulation parameter, and we demonstrate that MaxGCP increases GWAS power in a
+variety of realistic scenarios.
+"""
+
+import itertools
+import pathlib
+import re
+
+import numpy as np
+import pandas as pd
+import polars as pl
+
+
+def l(x):
+    """Ensure that x is a list."""
+    if isinstance(x, list):
+        return x
+    return [x]
+
+
+class Setting:
+    def __init__(self, i: int, h: float, s: float, p: float, m: float, v: float):
+        self.i = i
+        self.h = float(h)
+        self.s = float(s)
+        self.p = float(p)
+        self.m = float(m)
+        self.v = float(v)
+
+    def __str__(self):
+        return f"sim_{self.i}_h_{self.h}_s_{self.s}_p_{self.p}_m_{self.m}_v_{self.v}"
+
+    @classmethod
+    def from_string(cls, string):
+        regex = r"sim_(\d+)_h_([\.\d]+)_s_([\.\d]+)_p_([\.\d]+)_m_([\.\d]+)_v_([\.\d]+)"
+        i, h, s, p, m, v = re.match(regex, string).groups()
+        return cls(i, h, s, p, m, v)
+
+    def get_sim_string(self):
+        return f"sim_{self.i}_h_{self.h}_s_{self.s}_p_{self.p}"
+
+    @classmethod
+    def from_sim_string(cls, sim_string):
+        regex = r"sim_(\d+)_h_([\.\d]+)_s_([\.\d]+)_p_([\.\d]+)"
+        i, h, s, p = re.match(regex, sim_string).groups()
+        return cls(i, h, s, p, 0, 0)
+
+
+class Sims:
+    def __init__(self, settings: list[Setting]):
+        self.settings = settings
+
+    @classmethod
+    def build(cls, i, h, s, p, m, v):
+        settings = [
+            Setting(*x)
+            for x in itertools.product(l(i), l(h), l(s), l(p), l(m), l(v))
+        ]
+        return cls(settings)
+
+    def __add__(self, other):
+        return Sims(list(set(self.settings + other.settings)))
+
+    def unique(self):
+        return list(set(self.settings))
+
+
+n_sims = 100
+n_phenotypes = 50
+sim_dir = pathlib.Path("data/simulations")
+
+repeats = list(range(1, n_sims + 1))
+phenotype_names = [f"Trait_{i:02}" for i in range(1, n_phenotypes + 1)]
+
+simulations = (
+    # Ideal simulation
+    Sims.build(repeats, 0.5, 0.9, 0.0, 0.5, [0.0, 0.5]) +
+    # Realistic simulation
+    Sims.build(repeats, 0.01, 0.005, 0.0, 0.1, 0.05) +
+    # Heritability
+    Sims.build(repeats, [0.01, 0.1, 0.25, 0.5, 0.75, 0.9], 0.5, 0.0, 0.1, 0.05) +
+    # Shared variants
+    Sims.build(repeats, 0.1, [0.0, 0.1, 0.25, 0.5, 0.75, 0.9], 0.0, 0.1, 0.05) +
+    # Phenotypic correlations
+    Sims.build(repeats, 0.1, 0.5, [0.0, 0.25, 0.5, 0.75], 0.0, 0.05) +
+    # Missingness
+    Sims.build(repeats, 0.1, 0.5, 0.0, [0.0, 0.01, 0.05, 0.1, 0.25, 0.5], 0.05) +
+    # Noise in estimates of genetic covariance (h2/rg)
+    Sims.build(repeats, 0.1, 0.5, 0.0, 0.1, [0.0, 0.01, 0.05, 0.1, 0.5, 1.0])
+).unique()
+
+sim_names = list(set([s.get_sim_string() for s in simulations]))
+
+
+rule all:
+    input:
+        # Genotypes
+        expand("data/genotypes/G.{ext}", ext=["bed", "bim", "fam"]),
+        # Raw simulation
+        expand(
+            sim_dir.joinpath("{sim}/raw/{file}_raw.csv").as_posix(),
+            sim=sim_names,
+            file=["SNP_effects_NrSNP5000", "Ysim", "Y_genFixed", "Y_noiseBg"],
+        ),
+        # Formatted simulation
+        expand("data/simulations/{sim}/causal_effects.tsv", sim=sim_names),
+        expand("data/simulations/{sim}/pheno/liability.tsv", sim=sim_names),
+        expand("data/simulations/{sim}/pheno/g.tsv", sim=sim_names),
+        # Binary phenotypes
+        [
+            (sim_dir/s.get_sim_string()/f"pheno/binary_m_{s.m}.tsv").as_posix()
+            for s in simulations
+        ],
+        # Optimal phenotypes
+        [
+            (sim_dir/s.get_sim_string()/f"pheno/optimal.tsv").as_posix()
+            for s in simulations
+        ],
+        # Covariance matrices
+        expand("data/simulations/{sim}/pcov/{name}.tsv", sim=sim_names, name=["liability"]),
+        [
+            (sim_dir/s.get_sim_string()/f"gcov/g_{s.v}.tsv").as_posix()
+            for s in simulations
+        ],
+        [
+            (sim_dir/s.get_sim_string()/f"pcov/binary_m_{s.m}.tsv").as_posix()
+            for s in simulations
+        ],
+        # MaxGCP phenotypes
+        [
+            (sim_dir/s.get_sim_string()/f"pheno/maxgcp_m_{s.m}_v_{s.v}.tsv").as_posix()
+            for s in simulations
+        ],
+        # GWAS summary statistics
+        [
+            (sim_dir/s.get_sim_string()/f"gwas/{kind}.{p}.glm.linear.zst").as_posix()
+            for s in simulations
+            for kind in ["liability", "optimal", "g", f"binary_m_{s.m}", f"maxgcp_m_{s.m}_v_{s.v}"]
+            for p in phenotype_names
+        ],
+        # Summary
+        [
+            (sim_dir/s.get_sim_string()/f"summary/{kind}.tsv").as_posix()
+            for s in simulations
+            for kind in ["liability", "optimal", "g", f"binary_m_{s.m}", f"maxgcp_m_{s.m}_v_{s.v}"]
+        ],
+        # Full summary
+        "data/full_summary.tsv",
+        "data/full_gcov.tsv"
+
+
+## filter_genotypes: Build a set of genotypes for this analysis.
+gt_root = "/data1/home/mnz2108/data_resources/ukbiobank/hapmap3_genotypes"
+rule filter_genotypes:
+    input:
+        expand(
+            gt_root + "/hapmap3_variants_white_british.{ext}",
+            ext=["pgen", "psam", "pvar"]
+        ),
+    output:
+        expand("data/genotypes/G.{ext}", ext=["bed", "bim", "fam"]),
+    params:
+        input = lambda wc, input: input[0][:-5],
+        output = lambda wc, output: output[0][:-4],
+    shell:
+        """
+        plink2 \
+            --pfile {params.input} \
+            --geno 0 \
+            --seed 0 \
+            --thin-indiv-count 10000 \
+            --thin-count 100000 \
+            --make-pgen \
+            --out {params.output}
+
+        plink2 \
+            --pfile {params.output} \
+            --seed 0 \
+            --thin-count 10000 \
+            --make-bed \
+            --out {params.output}
+
+        rm data/genotypes/*.p*
+        """
+
+## simulate_phenotypes: Simulate genetic effects and phenotypes.
+rule simulate_phenotypes:
+    input:
+        geno = expand("data/genotypes/G.{ext}", ext=["bed", "bim", "fam"]),
+    output:
+        expand(
+            "data/simulations/sim_{{i}}_h_{{h}}_s_{{s}}_p_{{p}}/raw/{kind}_raw.csv",
+            kind=["SNP_effects_NrSNP5000", "Ysim", "Y_genFixed", "Y_noiseBg"],
+        ),
+    params:
+        geno = lambda wc, input: input.geno[0],
+        h = lambda wc: float(wc.h),
+        s = lambda wc: float(wc.s),
+        p = lambda wc: float(wc.p),
+        subdir = lambda wc, output: pathlib.Path(output[0]).parent.parent.name,
+        seed = lambda wc: int(wc.i),
+    shell:
+        """
+        Rscript -e \"PhenotypeSimulator::simulatePhenotypes()\" \
+            --NrSamples=10000 \
+            --NrPhenotypes={n_phenotypes} \
+            --format=\"plink\" \
+            --genotypefile={params.geno} \
+            --genVar={params.h} \
+            --h2s=1.0 \
+            --theta={params.s} \
+            --phi=1 \
+            --NrFixedEffects=0 \
+            --NrConfounders=0 \
+            --pcorr={params.p} \
+            --tNrSNP=10000 \
+            --cNrSNP=5000 \
+            --directory=data/simulations/{params.subdir} \
+            --subdirectory=raw \
+            --saveTable \
+            --seed={params.seed} \
+            --dontSaveIntermediate \
+            --showProgress
+        """
+
+## format_effects: Format the simulated genetic effects.
+rule format_effects:
+    input:
+        effects = "{sim_path}/raw/SNP_effects_NrSNP5000_raw.csv",
+    output:
+        causal_effects = "{sim_path}/causal_effects.tsv",
+    shell:
+        """
+        sed '1s/^,/phenotype,/g' {input.effects} |
+            xsv fmt -t $'\t' -o {output.causal_effects}
+        """
+
+# format_simulation: Format the simulation results.
+rule format_raw_phenotypes:
+    input:
+        effects = "{sim_path}/raw/SNP_effects_NrSNP5000_raw.csv",
+        ysim = "{sim_path}/raw/Ysim_raw.csv",
+        ygfixed = "{sim_path}/raw/Y_genFixed_raw.csv",
+        ynbg = "{sim_path}/raw/Y_noiseBg_raw.csv",
+    output:
+        pheno = "{sim_path}/pheno/liability.tsv",
+        g = "{sim_path}/pheno/g.tsv",
+    shell:
+        """
+        python scripts/format_simulation.py \
+            --ysim {input.ysim} \
+            --ygfixed {input.ygfixed} \
+            --ynbg {input.ynbg} \
+            --output-pheno {output.pheno} \
+            --output-g {output.g}
+        """
+
+## binarize_phenotypes: Convert liability phenotypes to binary.
+rule binarize_phenotypes:
+    input:
+        "{sim_path}/pheno/liability.tsv",
+    output:
+        "{sim_path}/pheno/binary_m_0.0.tsv",
+    run:
+        (
+            pd.read_csv(input[0], index_col=[0, 1], sep="\t")
+            .pipe(lambda df: (df > 0.5).astype(int) + 2)
+            .to_csv(output[0], sep="\t")
+        )
+
+## miss_phenotypes: Simulate missing phenotypes.
+rule miss_phenotypes:
+    input:
+        "data/simulations/sim_{i,[0-9]+}_{other}/pheno/binary_m_0.0.tsv",
+    output:
+        "data/simulations/sim_{i,[0-9]+}_{other}/pheno/binary_m_{m}.tsv",
+    params:
+        seed = lambda wc: int(wc.i),
+        missing = lambda wc: float(wc.m) / 100,
+    run:
+        import pandas as pd
+        y_df = pd.read_csv(input[0], index_col=[0, 1], sep="\t")
+        np.random.seed(params.seed)
+        # 50% cases -> drop 50% -> 25% cases missing, on average
+        mask = np.random.rand(*y_df.shape) < 2 * params.missing
+        y_df[mask] = 2
+        y_df.to_csv(output[0], sep="\t")
+
+## build_pcov: Compute a phenotypic covariance matrix.
+rule build_pcov:
+    input:
+        "{sim_path}/pheno/{name}.tsv",
+    output:
+        "{sim_path}/pcov/{name}.tsv",
+    run:
+        (
+            pd.read_csv(input[0], sep="\t", index_col=[0, 1])
+            .cov()
+            .astype(np.float32)
+            .pipe(lambda df: df.loc[df.columns, df.columns])
+            .to_csv(output[0], sep="\t", index=True)
+        )
+
+## build_gcov: Compute genetic covariance matrix using the genetic component.
+rule build_gcov:
+    input:
+        "{sim_path}/pheno/g.tsv",
+    output:
+        "{sim_path}/gcov/g_0.0.tsv",
+    run:
+        (
+            pd.read_csv(input[0], sep="\t", index_col=[0, 1])
+            .cov()
+            .astype(np.float32)
+            .pipe(lambda df: df.loc[df.columns, df.columns])
+            .to_csv(output[0], sep="\t", index=True)
+        )
+
+## add_gcov_noise: Add noise to a genetic covariance matrix.
+rule add_gcov_noise:
+    input:
+        "data/simulations/sim_{i,[0-9]+}_{other}/gcov/g_0.0.tsv",
+    output:
+        "data/simulations/sim_{i,[0-9]+}_{other}/gcov/g_{v}.tsv",
+    params:
+        v = lambda wc: float(wc.v),
+        seed = lambda wc: int(wc.i),
+    run:
+        df = pd.read_csv(input[0], sep="\t", index_col=0)
+        np.random.seed(params.seed)
+        noise = np.random.normal(1, np.sqrt(params.v), size=df.shape)
+        noise = np.triu(noise) + np.triu(noise, 1).T
+        df *= noise
+        df.to_csv(output[0], sep="\t", float_format="%.6f")
+
+## optimal_linear_combination: Compute the optimal linear combination of phenotypes.
+rule optimal_linear_combination:
+    input:
+        p = "{sim_path}/pheno/binary_m_0.0.tsv",
+        g = "{sim_path}/pheno/g.tsv",
+    output:
+        coef = "{sim_path}/coef/optimal.tsv",
+        h2 = "{sim_path}/h2/optimal.tsv",
+        pheno = "{sim_path}/pheno/optimal.tsv",
+    shell:
+        """
+        python scripts/compute_optimal.py --p {input.p} --g {input.g} \
+            --output-coef {output.coef} --output-h2 {output.h2} \
+            --output-pheno {output.pheno}
+        """
+
+## maxgcp: Fit a MaxGCP model on simulated data.
+rule maxgcp:
+    input:
+        gcov = "{sim_path}/gcov/g_{v}.tsv",
+        pcov = "{sim_path}/pcov/binary_m_{m}.tsv",
+        pheno = "{sim_path}/pheno/binary_m_{m}.tsv",
+    output:
+        coef = "{sim_path}/coef/maxgcp_m_{m}_v_{v}.tsv",
+        h2 = "{sim_path}/h2/maxgcp_m_{m}_v_{v}.tsv",
+        pheno = "{sim_path}/pheno/maxgcp_m_{m}_v_{v}.tsv",
+    conda: "snake"
+    shell:
+        """
+        python scripts/compute_maxgcp.py \
+            --gcov {input.gcov} --pcov {input.pcov} --pheno {input.pheno} \
+            --output-coef {output.coef} --output-h2 {output.h2} \
+            --output-pheno {output.pheno}
+        """
+
+
+## gwas: Compute GWAS on a given set of phenotypes.
+rule gwas:
+    input:
+        geno = expand("data/genotypes/G.{ext}", ext=["bed", "bim", "fam"]),
+        pheno = "data/simulations/{sim}/pheno/{kind}.tsv",
+    output:
+        expand(
+            "data/simulations/{{sim}}/gwas/{{kind}}.{p}.glm.linear.zst",
+            p=phenotype_names,
+        ),
+    params:
+        bfile = lambda wc, input: pathlib.Path(input.geno[0]).with_suffix(""),
+        output = "data/simulations/{sim}/gwas/{kind}",
+    # threads: 16,
+    shell:
+        """
+        plink2 --bfile {params.bfile} --pheno {input.pheno} \
+            --glm allow-no-covars hide-covar zs --out {params.output}
+        """
+
+## evaluate: Compute sensitivity, specificity, AUROC, etc. from GWAS results.
+rule evaluate:
+    input:
+        causal = "data/simulations/{sim}/causal_effects.tsv",
+        other = expand(
+            "data/simulations/{{sim}}/gwas/{{kind}}.{p}.glm.linear.zst",
+            p=phenotype_names,
+        ),
+        g = expand(
+            "data/simulations/{{sim}}/gwas/g.{p}.glm.linear.zst",
+            p=phenotype_names,
+        ),
+    output:
+        "data/simulations/{sim}/summary/{kind}.tsv",
+    shell:
+        """
+        python scripts/compute_summary.py --pheno {input.other} \
+            --g {input.g} --causal {input.causal} --output {output[0]}
+        """
+
+## gather_summary: Gather all those summary files into a single file.
+rule gather_summary:
+    input:
+        [
+            (sim_dir/s.get_sim_string()/f"summary/{kind}.tsv").as_posix()
+            for s in simulations
+            for kind in ["liability", "optimal", "g", f"binary_m_{s.m}", f"maxgcp_m_{s.m}_v_{s.v}"]
+        ],
+    output:
+        "data/full_summary.tsv"
+    run:
+        full_df = list()
+        for path in input:
+            df = (
+                pl.read_csv(path, separator="\t")
+                .with_columns(path=pl.lit(path))
+            )
+            full_df.append(df)
+        full_df = pl.concat(full_df, how="vertical_relaxed")
+        full_df.write_csv(output[0], separator="\t")
+
+## gather_gcov: Gather all the genetic covariances into a single file.
+rule gather_gcov:
+    input:
+        [
+            (sim_dir/s.get_sim_string()/f"gcov/g_{s.v}.tsv").as_posix()
+            for s in simulations
+        ],
+    output:
+        "data/full_gcov.tsv"
+    run:
+        full_df = list()
+        for path in input:
+            df = (
+                pl.read_csv(path, separator="\t")
+                .with_columns(path=pl.lit(path))
+            )
+            full_df.append(df)
+        full_df = pl.concat(full_df, how="vertical_relaxed")
+        full_df.write_csv(output[0], separator="\t")
