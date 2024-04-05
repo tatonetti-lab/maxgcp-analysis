@@ -64,6 +64,7 @@ rule all:
     "data/pheno/samples_sub_0.tsv",
     multiext("data/geno/geno_sub_0", ".bed", ".bim", ".fam"),
     "data/pcov/pcov_sub_0.tsv",
+    "data/gcov/gcov_sub_0.tsv",
 
 
 rule subsample_cohort:
@@ -139,18 +140,15 @@ rule haseman_elston:
     """
 
 
+rule gather_successful_rg:
   input:
-    "data/pheno/pheno_sub_{seed}.tsv",
+    [f"data/rg/rg_sub_0_{i}_{j}.HEreg" for i, j in pheno_idx_pairs],
   output:
-    "data/pcov/pcov_sub_{seed}.tsv",
-  run:
-    (
-        pl.read_csv(input[0], separator="\t")
-        .select("^b_.+$")
-        .to_pandas()
-        .cov()
-        .to_csv(output[0], sep="\t")
-    )
+    "data/rg/rg_sub_{seed}_successful.txt",
+  conda:
+    "phd"
+  notebook:
+    "1.gather_rg.py.ipynb"
 
 
 rule compute_phenotypic_correlation:
