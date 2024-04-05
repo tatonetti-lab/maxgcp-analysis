@@ -46,7 +46,9 @@ def main():
         summary_df.to_csv(args.output_h2, sep="\t", index=False)
 
     if args.pheno is not None:
-        phenotypes_df = pd.read_csv(args.pheno, sep="\t", index_col=[0, 1])
+        phenotypes_df = pd.read_csv(args.pheno, sep="\t", index_col=[0, 1]).loc[
+            :, feature_names  # type: ignore
+        ]
         maxgcp_phenotypes_df = phenotypes_df @ coef_df
         maxgcp_phenotypes_df.to_csv(args.output_pheno, sep="\t", index=True)
 

@@ -369,7 +369,7 @@ rule maxgcp:
     conda: "snake"
     shell:
         """
-        python scripts/compute_maxgcp.py \
+        python ../scripts/compute_maxgcp.py \
             --gcov {input.gcov} --pcov {input.pcov} --pheno {input.pheno} \
             --output-coef {output.coef} --output-h2 {output.h2} \
             --output-pheno {output.pheno}
