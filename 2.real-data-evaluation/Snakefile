@@ -65,6 +65,7 @@ rule all:
     multiext("data/geno/geno_sub_0", ".bed", ".bim", ".fam"),
     "data/pcov/pcov_sub_0.tsv",
     "data/gcov/gcov_sub_0.tsv",
+    "data/coef/maxgcp_sub_0.tsv",
 
 
 rule subsample_cohort:
@@ -174,3 +175,35 @@ rule compute_phenotypic_correlation:
         pd.DataFrame(cov, index=pheno_names, columns=pheno_names)
         .to_csv(output[0], sep="\t")
     )
+
+
+rule filter_phenotypic_correlation:
+  input:
+    pcov = "data/pcov/pcov_sub_{seed}.tsv",
+    gcov = "data/gcov/gcov_sub_{seed}.tsv",
+  output:
+    "data/pcov/pcov_filtered_sub_{seed}.tsv",
+  run:
+    gcov_index = pd.read_csv(input.gcov, sep="\t", index_col=0).index
+    pcov_df = pd.read_csv(input.pcov, sep="\t", index_col=0)
+    pcov_df = pcov_df.loc[gcov_index, gcov_index]
+    pcov_df.to_csv(output[0], sep="\t")
+
+
+rule maxgcp:
+    input:
+      gcov = "data/gcov/gcov_sub_{seed}.tsv",
+      pcov = "data/pcov/pcov_filtered_sub_{seed}.tsv",
+      pheno = "data/pheno/pheno_sub_{seed}.tsv",
+    output:
+      coef = "data/coef/maxgcp_sub_{seed}.tsv",
+      h2 = "data/h2/maxgcp_sub_{seed}.tsv",
+      pheno = "data/pheno/maxgcp_sub_{seed}.tsv",
+    conda: "phd"
+    shell:
+        """
+        python ../scripts/compute_maxgcp.py \
+          --gcov {input.gcov} --pcov {input.pcov} --pheno {input.pheno} \
+          --output-coef {output.coef} --output-h2 {output.h2} \
+          --output-pheno {output.pheno}
+        """
