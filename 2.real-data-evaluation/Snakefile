@@ -40,8 +40,9 @@ root = pathlib.Path(".")
 pheno_path = root.joinpath("../data/pheno/pheno_jan2024.tsv")
 covar_path = root.joinpath("../data/pheno/covar.tsv")
 geno_path = (
-    "/data1/home/mnz2108/data_resources/ukbiobank/hapmap3_genotypes/"
-    "hapmap3_variants_white_british"
+    "/data1/home/mnz2108/"  # mimir
+    # "/data2/michael/"    # eir
+    "data_resources/ukbiobank/hapmap3_genotypes/hapmap3_variants_white_british"
 )
 
 phenotype_names = (
@@ -66,6 +67,8 @@ rule all:
     "data/pcov/pcov_sub_0.tsv",
     "data/gcov/gcov_sub_0.tsv",
     "data/coef/maxgcp_sub_0.tsv",
+    "data/gwas/naive_sub_0.log",
+    "data/gwas/maxgcp_sub_0.log",
 
 
 rule subsample_cohort:
@@ -191,19 +194,69 @@ rule filter_phenotypic_correlation:
 
 
 rule maxgcp:
-    input:
-      gcov = "data/gcov/gcov_sub_{seed}.tsv",
-      pcov = "data/pcov/pcov_filtered_sub_{seed}.tsv",
-      pheno = "data/pheno/pheno_sub_{seed}.tsv",
-    output:
-      coef = "data/coef/maxgcp_sub_{seed}.tsv",
-      h2 = "data/h2/maxgcp_sub_{seed}.tsv",
-      pheno = "data/pheno/maxgcp_sub_{seed}.tsv",
-    conda: "phd"
-    shell:
-        """
-        python ../scripts/compute_maxgcp.py \
-          --gcov {input.gcov} --pcov {input.pcov} --pheno {input.pheno} \
-          --output-coef {output.coef} --output-h2 {output.h2} \
-          --output-pheno {output.pheno}
-        """
+  input:
+    gcov = "data/gcov/gcov_sub_{seed}.tsv",
+    pcov = "data/pcov/pcov_filtered_sub_{seed}.tsv",
+    pheno = "data/pheno/pheno_sub_{seed}.tsv",
+  output:
+    coef = "data/coef/maxgcp_sub_{seed}.tsv",
+    h2 = "data/h2/maxgcp_sub_{seed}.tsv",
+    pheno = "data/pheno/maxgcp_sub_{seed}.tsv",
+  conda: "phd"
+  shell:
+      """
+      python ../scripts/compute_maxgcp.py \
+        --gcov {input.gcov} --pcov {input.pcov} --pheno {input.pheno} \
+        --output-coef {output.coef} --output-h2 {output.h2} \
+        --output-pheno {output.pheno}
+      """
+
+
+rule filter_phenotypes:
+  input:
+    pheno = "data/pheno/pheno_sub_{seed}.tsv",
+    coef = "data/coef/maxgcp_sub_{seed}.tsv",
+  output:
+    pheno = "data/pheno/pheno_filtered_sub_{seed}.tsv",
+  run:
+    pheno_df = pd.read_csv(input.pheno, sep="\t", index_col=[0, 1])
+    coef_df = pd.read_csv(input.coef, sep="\t", index_col=0)
+    filtered_pheno_df = pheno_df.loc[:, coef_df.index]
+    filtered_pheno_df.to_csv(output.pheno, sep="\t")
+
+
+rule gwas_naive:
+  input:
+    geno = multiext("data/geno/geno_sub_{seed}", ".bed", ".bim", ".fam"),
+    pheno = "data/pheno/pheno_filtered_sub_{seed}.tsv",
+    covar = "data/pheno/covar_sub_{seed}.tsv",
+  output:
+    "data/gwas/naive_sub_{seed}.log",
+  params:
+    geno_prefix = "data/geno/geno_sub_{seed}",
+    output_prefix = "data/gwas/naive_sub_{seed}",
+  threads: 35
+  shell:
+    """
+    plink2 --bfile {params.geno_prefix} --pheno {input.pheno} \
+      --covar {input.covar} --glm hide-covar zs --out {params.output_prefix}
+    """
+
+
+rule gwas_maxgcp:
+  input:
+    geno = multiext("data/geno/geno_sub_{seed}", ".bed", ".bim", ".fam"),
+    pheno = "data/pheno/maxgcp_sub_{seed}.tsv",
+    covar = "data/pheno/covar_sub_{seed}.tsv",
+  output:
+    "data/gwas/maxgcp_sub_{seed}.log",
+  params:
+    geno_prefix = "data/geno/geno_sub_{seed}",
+    output_prefix = "data/gwas/maxgcp_sub_{seed}",
+  threads: 35
+  shell:
+    """
+    plink2 --bfile {params.geno_prefix} --pheno {input.pheno} \
+      --threads {threads} --covar {input.covar} --glm hide-covar zs \
+      --out {params.output_prefix}
+    """
