@@ -260,3 +260,37 @@ rule gwas_maxgcp:
       --threads {threads} --covar {input.covar} --glm hide-covar zs \
       --out {params.output_prefix}
     """
+
+
+rule filter_phenotypes_full_size:
+  input:
+    pheno = pheno_path,
+    coef = "data/coef/maxgcp_sub_{seed}.tsv",
+  output:
+    pheno = "data/pheno/pheno_filtered_full_{seed}.tsv",
+  run:
+    coef_df = pd.read_csv(input.coef, sep="\t", index_col=0)
+    (
+        pl.scan_csv(input.pheno, separator="\t")
+        .select("^.*FID$", "IID", *coef_df.index)
+        .sink_csv(output.pheno, separator="\t")
+    )
+
+
+rule gwas_full:
+  input:
+    geno = multiext(geno_path, ".pgen", ".psam", ".pvar"),
+    pheno = "data/pheno/pheno_filtered_full_{seed}.tsv",
+    covar = covar_path,
+  output:
+    "data/gwas/full_{seed}.log",
+  params:
+    geno_prefix = geno_path,
+    output_prefix = "data/gwas/full_{seed}",
+  threads: 35
+  shell:
+    """
+    plink2 --pfile {params.geno_prefix} --pheno {input.pheno} \
+      --threads {threads} --covar {input.covar} --glm hide-covar zs \
+      --out {params.output_prefix}
+    """
