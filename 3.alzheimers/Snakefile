@@ -1,0 +1,299 @@
+"""Alzheimers comparison
+
+This analysis compares two methods for defining phenotypes (naive and MaxGCP).
+We'll compute GWAS summary statistics for several variations of these two
+methods, then compare their ability to replicate Alzheimer's GWAS results.
+
+IGAP summary statistics available at https://www.niagads.org/datasets/ng00036
+"""
+import pathlib
+import re
+
+import numpy as np
+import pandas as pd
+import polars as pl
+
+
+geno_path = (
+    # "/data1/home/mnz2108/"  # mimir
+    "/data2/michael/"    # eir
+    "data_resources/ukbiobank/hapmap3_genotypes/hapmap3_variants_white_british"
+)
+
+feature_phenotypes = {
+    "alzheimers": "b_G30",
+    "cerebral_infarction": "b_I63",
+    "acute_myocardial_infarction": "b_I21",
+    "essential_hypertension": "b_I10",
+    "obesity": "b_E66",
+    "acute_ischemic_heart_disease": "b_I24",
+    "ischemic_heart_disease": "b_I25",
+    "pulmonary_heart_diseases": "b_I27",
+    "other_heart_disease": "b_I51",
+    "other_cerebrovascular": "b_I67",
+    "dm1": "b_E10",
+    "dm2": "b_E11",
+    "hba1c": "q_30750_0",
+    "hdl_cholesterol": "q_30760_0",
+    "glucose": "q_30740_0",
+    "cholesterol": "q_30690_0",
+    "triglycerides": "q_30870_0",
+    "lipoprotein_a": "q_30790_0",
+    "apolipoprotein_b": "q_30640_0",
+    "creatinine": "q_30700_0"
+}
+features = sorted(feature_phenotypes.values())
+sub_features = [f"sub_{f}" for f in features]
+alzheimers = "b_G30"
+
+
+rule all:
+  input:
+    "data/pheno/naive.tsv",
+    expand("data/gwas/naive.{pheno}.glm.linear", pheno=features + sub_features),
+    "data/gwas/naive.log",
+    "data/pcov/naive_full.tsv",
+    "data/pcov/naive_sub.tsv",
+    "data/gwas/igap.ldak",
+    expand("data/rg/igap.naive.{pheno}.cors", pheno=features + sub_features),
+    "data/pheno/maxgcp.tsv",
+    "data/gwas/maxgcp.log",
+
+
+rule pick_initial_phenotypes:
+  input:
+    "../data/pheno/pheno_jan2024.tsv",
+  output:
+    "data/pheno/naive.tsv",
+  run:
+    pheno_df = (
+        pl.read_csv(input[0], separator="\t", columns=["#FID", "IID"] + features)
+        .select(["#FID", "IID"] + features)
+    )
+    case_df = pheno_df.filter(pl.col(alzheimers).eq(3))
+    control_df = pheno_df.filter(pl.col(alzheimers).eq(2)).sample(n=len(case_df), seed=0)
+    subsampled_df = (
+        pl.concat([case_df, control_df])
+        .rename(lambda x: x if x in {"#FID", "IID"} else f"sub_{x}")
+    )
+    (
+        pheno_df
+        .join(subsampled_df, how="left", on=["#FID", "IID"])
+        .rename({"#FID": "FID"})
+        .write_csv(output[0], separator="\t", null_value="NA")
+    )
+
+
+rule gwas_naive:
+  input:
+    pheno = "data/pheno/naive.tsv",
+    covar = "../data/pheno/covar.tsv",
+    geno = multiext(geno_path, ".pgen", ".psam", ".pvar"),
+  output:
+    expand("data/gwas/naive.{pheno}.glm.linear", pheno=features + sub_features),
+    "data/gwas/naive.log",
+  params:
+    geno_prefix = geno_path,
+    output_prefix = "data/gwas/naive",
+  threads: 55
+  shell:
+    """
+    plink2 --pfile {params.geno_prefix} --pheno {input.pheno} \
+      --covar {input.covar} --glm hide-covar --threads {threads} \
+      --out {params.output_prefix}
+    """
+
+
+rule compute_phenotypic_covariance:
+  input:
+    pheno = "data/pheno/naive.tsv",
+    covar = "../data/pheno/covar.tsv",
+  output:
+    full = "data/pcov/naive_full.tsv",
+    sub = "data/pcov/naive_sub.tsv",
+  run:
+    dtypes = [pl.Int64] * 2 + [pl.Float64] * (len(features) + len(sub_features))
+    pheno_df = (
+        pl.read_csv(input.pheno, separator="\t", dtypes=dtypes, null_values=["NA"])
+        .drop("FID")
+    )
+    covar_df = pl.read_csv(input.covar, separator="\t", null_values=["NA"]).drop("#FID")
+    covariates = covar_df.drop("IID").columns
+    merged_df = pheno_df.join(covar_df, on=["IID"])
+    # Full phenotypes
+    X = merged_df.select(covariates, const=1).to_numpy()
+    Y = merged_df.select(features).to_numpy()
+    beta = np.linalg.lstsq(X, Y, rcond=None)[0]
+    residuals = Y - X @ beta
+    cov = np.cov(residuals, rowvar=False)
+    (
+        pd.DataFrame(cov, index=features, columns=features)
+        .to_csv(output.full, sep="\t")
+    )
+    # Subsampled phenotypes
+    merged_df = (
+        merged_df
+        .select(sub_features + covariates)
+        .drop_nulls()
+    )
+    X = merged_df.select(covariates, const=1).to_numpy()
+    Y = merged_df.select(sub_features).to_numpy()
+    beta = np.linalg.lstsq(X, Y, rcond=None)[0]
+    residuals = Y - X @ beta
+    cov = np.cov(residuals, rowvar=False)
+    (
+        pd.DataFrame(cov, index=sub_features, columns=sub_features)
+        .to_csv(output.sub, sep="\t")
+    )
+
+
+rule format_igap_gwas:
+  input:
+    gwas = "../data/igap/IGAP_stage_1.txt",
+  output:
+    gwas = "data/gwas/igap.ldak",
+  run:
+    (
+        pl.read_csv(input.gwas, separator="\t")
+        .select(
+            Predictor=pl.col("Chromosome").cast(pl.Utf8) + ":" + pl.col("Position").cast(pl.Utf8),
+            A1=pl.col("Effect_allele"),
+            A2=pl.col("Non_Effect_allele"),
+            n=pl.lit(17_008+37_154),  # 17,008 cases and 37,154 controls
+            Z=pl.col("Beta").truediv(pl.col("SE")),
+        )
+        .write_csv(output.gwas, separator="\t", float_precision=6)
+    )
+
+
+rule format_plink_gwas:
+  input:
+    "data/gwas/{pheno}.glm.linear"
+  output:
+    "data/gwas/{pheno}.glm.linear.ldak"
+  shell:
+    "sumher_rs fmt -g {input} -o {output}"
+
+
+
+rule compute_genetic_correlation:
+  input:
+    ad = "data/gwas/igap.ldak",
+    naive = "data/gwas/naive.{pheno}.glm.linear.ldak",
+  output:
+    "data/rg/igap.naive.{pheno}.cors",
+  threads: 1
+  params:
+    output_prefix = "data/rg/igap.naive.{pheno}",
+  shell:
+    """
+    ldak5.2.linux \
+      --summary {input.ad} \
+      --summary2 {input.naive} \
+      --sum-cors {params.output_prefix} \
+      --check-sums NO --cutoff 0.01 \
+      --tagfile /data2/michael/data_resources/ldak/ldak.thin.hapmap.gbr.tagging
+    """
+
+
+rule collect_genetic_correlations:
+  input:
+    collect("data/rg/igap.naive.{pheno}.cors", pheno=features + sub_features),
+  output:
+    "data/gcov/igap.naive.tsv",
+  run:
+    dfs = list()
+    for path in input:
+        path = pathlib.Path(path)
+        pheno_id = re.search("(?<=naive\.).+$", path.stem).group()
+        df = (
+            pd.read_csv(path, sep="\s+")
+            .assign(phenotype_id=pheno_id)
+        )
+        dfs.append(df)
+
+    pd.concat(dfs).to_csv(output[0], sep="\t", index=False)
+
+
+rule compute_maxgcp:
+  input:
+    pheno = "data/pheno/naive.tsv",
+    gcov = "data/gcov/igap.naive.tsv",
+    pcov_full = "data/pcov/naive_full.tsv",
+    pcov_sub = "data/pcov/naive_sub.tsv",
+  output:
+    pheno = "data/pheno/maxgcp.tsv",
+  run:
+    dtypes = [pl.Int64] * 2 + [pl.Float64] * (len(features) + len(sub_features))
+    pheno_df = pl.read_csv(input.pheno, separator="\t", dtypes=dtypes, null_values=["NA"])
+    gcov_df = pl.read_csv(input.gcov, separator="\t")
+    pcov_dfs = {
+        "full": pd.read_csv(input.pcov_full, sep="\t", index_col=0),
+        "sub": pd.read_csv(input.pcov_sub, sep="\t", index_col=0)
+    }
+
+    gcov_filtered_df = (
+        gcov_df
+        # Apply heritability QC filter
+        .filter(pl.col("Component").eq("Her2_All"))
+        .filter(pl.col("Value").ge(0) & pl.col("Value").le(1))
+        .select("phenotype_id")
+        .unique()
+        # Apply genetic correlation QC filter
+        .join(gcov_df, on="phenotype_id")
+        .filter(pl.col("Component").eq("Cor_All"))
+        .filter(pl.col("Value").ge(-1) & pl.col("Value").le(1))
+        .select("phenotype_id")
+        .unique()
+        .join(gcov_df, on=["phenotype_id"])
+        .filter(pl.col("Component").eq("Coher_All"))
+        .drop(["Component"])
+        .with_columns(
+            cohort=pl.when(pl.col("phenotype_id").str.contains("sub"))
+                .then(pl.lit("sub")).otherwise(pl.lit("full"))
+        )
+        .to_pandas()
+    )
+
+    maxgcp_df = list()
+    groups = gcov_filtered_df.groupby("cohort")
+    for cohort, group_df in groups:
+        gcov_vec = (
+            group_df
+            .set_index("phenotype_id")
+            .loc[:, "Value"]
+        )
+        index = gcov_vec.index
+        sub_pcov_df = pcov_dfs[cohort].loc[index, index]
+        beta = np.linalg.lstsq(sub_pcov_df, gcov_vec, rcond=None)[0]
+        beta /= beta @ sub_pcov_df @ beta
+        beta_vec = pd.Series(beta, index=index)
+
+        feature_df = pheno_df.to_pandas().set_index(["FID", "IID"]).loc[:, index]
+        maxgcp_vec = feature_df @ beta_vec
+        maxgcp_df.append(maxgcp_vec.rename(f"maxgcp_{cohort}"))
+
+    maxgcp_df = (
+        pd.concat(maxgcp_df, axis=1, ignore_index=False)
+        .sort_index(axis=1)
+    )
+    maxgcp_df.to_csv(output.pheno, sep="\t", na_rep="NA")
+
+
+rule direct_gwas_maxgcp:
+  input:
+    pheno = "data/pheno/maxgcp.tsv",
+    covar = "../data/pheno/covar.tsv",
+    geno = multiext(geno_path, ".pgen", ".psam", ".pvar"),
+  output:
+    "data/gwas/maxgcp.log",
+  params:
+    geno_prefix = geno_path,
+    output_prefix = "data/gwas/maxgcp",
+  threads: 55
+  shell:
+    """
+    plink2 --pfile {params.geno_prefix} --pheno {input.pheno} \
+      --covar {input.covar} --glm hide-covar zs --threads {threads} \
+      --out {params.output_prefix}
+    """
