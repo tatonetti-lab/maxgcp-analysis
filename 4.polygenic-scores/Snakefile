@@ -42,7 +42,12 @@ rule all:
         expand(data_path + "/maxgcp_gwas/maxgcp.{pheno}.glm.linear", pheno=features),
         data_path + "/pheno_maxh.tsv",
         data_path + "/pheno_maxh_individual.tsv",
-        expand(data_path + "/maxh_gwas/maxh.{pheno}.glm.linear", pheno=features)
+        expand(data_path + "/maxh_gwas/maxh.{pheno}.glm.linear", pheno=features),
+        expand(data_path + "/prs/naive_prs.{pheno}.sscore", pheno=features),
+        expand(data_path + "/prs/pca_prs.{PC}.sscore", PC=PCs),
+        expand(data_path + "/prs/maxgcp_prs.{pheno}.sscore", pheno=features),
+        expand(data_path + "/prs/maxh_prs.{pheno}.sscore", pheno=features)
+        
         
         
         
@@ -69,7 +74,7 @@ rule quality_control:
         qc_path + "/filtered_kpg.pvar"
     params:
         geno_prefix = geno_path,
-        out_prefix = qc_path + "/filtered_kpg"
+        out_prefix = qc_path + "/filtered_kpg",
         plink = plink_path + "/plink2"
     shell:
         """
@@ -91,7 +96,7 @@ rule gwas_naive:
         expand(data_path + "/gwas/naive.{pheno}.glm.linear", pheno=features)
     params:
         geno_prefix = qc_path + "/filtered_kpg",
-        output_prefix = data_path + "/gwas/naive"
+        output_prefix = data_path + "/gwas/naive",
         plink = plink_path + "/plink2"
     threads: 55
     shell:
@@ -121,7 +126,7 @@ rule pca_gwas:
         expand(data_path + "/pca_gwas/pca.{PC}.glm.linear", PC=PCs)
     params:
         geno_prefix = qc_path + "/filtered_kpg",
-        output_prefix = data_path + "/pca_gwas/pca"
+        output_prefix = data_path + "/pca_gwas/pca",
         plink = plink_path + "/plink2"
     threads: 55
     shell:
@@ -266,7 +271,7 @@ rule maxgcp_gwas:
         expand(data_path + "/maxgcp_gwas/maxgcp.{pheno}.glm.linear", pheno=features)
     params:
         geno_prefix = qc_path + "/filtered_kpg",
-        output_prefix = data_path + "/maxgcp_gwas/maxgcp"
+        output_prefix = data_path + "/maxgcp_gwas/maxgcp",
         plink = plink_path + "/plink2"
     threads: 55
     shell:
@@ -313,7 +318,7 @@ rule maxh_gwas:
         expand(data_path + "/maxh_gwas/maxh.{pheno}.glm.linear", pheno=features)
     params:
         geno_prefix = qc_path + "/filtered_kpg",
-        output_prefix = data_path + "/maxh_gwas/maxh"
+        output_prefix = data_path + "/maxh_gwas/maxh",
         plink = plink_path + "/plink2"
     threads: 55
     shell:
@@ -322,3 +327,68 @@ rule maxh_gwas:
         --covar {input.covar} --glm hide-covar --threads {threads} \
         --out {params.output_prefix}
         """
+
+rule compute_prs_naive:
+    input:
+        geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar"),
+        gwas_naive = data_path + "/gwas/naive.{features}.glm.linear"
+    output:
+        data_path + "/prs/naive_prs.{features}.sscore"
+    params:
+        geno_prefix = qc_path + "/filtered_kpg",
+        output_prefix = data_path + "/prs/naive_prs.{features}" ,
+        plink = plink_path + "/plink2"
+    shell:
+        """
+        {params.plink} --pfile {params.geno_prefix}  \
+        --score {input.gwas_naive} 3 5 11 header --out {params.output_prefix}
+        """
+
+rule compute_prs_pca:
+    input:
+        geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar"),
+        gwas_pca = data_path + "/pca_gwas/pca.{PCs}.glm.linear"
+    output:
+        data_path + "/prs/pca_prs.{PCs}.sscore"
+    params:
+        geno_prefix = qc_path + "/filtered_kpg",
+        output_prefix = data_path + "/prs/pca_prs.{PCs}" ,
+        plink = plink_path + "/plink2"
+    shell:
+        """
+        {params.plink} --pfile {params.geno_prefix}  \
+        --score {input.gwas_pca} 3 5 11 header --out {params.output_prefix}
+        """
+
+rule compute_prs_maxgcp:
+    input:
+        geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar"),
+        gwas_maxgcp = data_path + "/maxgcp_gwas/maxgcp.{features}.glm.linear"
+    output:
+        data_path + "/prs/maxgcp_prs.{features}.sscore"
+    params:
+        geno_prefix = qc_path + "/filtered_kpg",
+        output_prefix = data_path + "/prs/maxgcp_prs.{features}" ,
+        plink = plink_path + "/plink2"
+    shell:
+        """
+        {params.plink} --pfile {params.geno_prefix}  \
+        --score {input.gwas_maxgcp} 3 5 11 header --out {params.output_prefix}
+        """
+
+rule compute_prs_maxh:
+    input:
+        geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar"),
+        gwas_maxh = data_path + "/maxh_gwas/maxh.{features}.glm.linear"
+    output:
+        data_path + "/prs/maxh_prs.{features}.sscore"
+    params:
+        geno_prefix = qc_path + "/filtered_kpg",
+        output_prefix = data_path + "/prs/maxh_prs.{features}" ,
+        plink = plink_path + "/plink2"
+    shell:
+        """
+        {params.plink} --pfile {params.geno_prefix}  \
+        --score {input.gwas_maxh} 3 5 11 header --out {params.output_prefix}
+        """
+        
