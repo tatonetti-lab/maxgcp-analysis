@@ -1,0 +1,324 @@
+"""
+Run an entire MaxGCP GWAS via a snakefile
+"""
+ruleorder: format_sumher > compute_cov_sumher
+
+import pathlib
+import re
+
+import numpy as np
+import pandas as pd
+import polars as pl
+import maxgcp
+
+data_path = ("Documents/TLAB/Plink/sample_data")
+geno_path = ("Documents/TLAB/Plink/sample_data/kgp")
+qc_path = ("Documents/TLAB/Plink/sample_data/qc")
+plink_path = ("Documents/TLAB/Plink")
+
+# Features should be changed into ICD-10 codes later
+features = ["pheno_0", "pheno_1", "pheno_2", "pheno_3", "pheno_4", "pheno_5", "pheno_6", "pheno_7", "pheno_8", "pheno_9"]
+
+PCs = ["PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9", "PC10"]
+
+
+
+rule all:
+    input:
+        data_path + "/subsampled_phenotypes.tsv",
+        qc_path + "/filtered_kpg.pgen",
+        qc_path + "/filtered_kpg.psam",
+        qc_path + "/filtered_kpg.pvar",
+        expand(data_path + "/gwas/naive.{pheno}.glm.linear", pheno=features),
+        data_path + "/pca_gwas/pheno_pc.tsv",
+        data_path + "/pca_gwas/pca_loadings.tsv",
+        expand(data_path + "/pca_gwas/pca.{PC}.glm.linear", PC=PCs),
+        expand(data_path + "/gwas/naive.{pheno}.glm.linear.ldak", pheno=features),
+        expand(data_path + "/gwas/naive.{pheno}.formatted.glm.linear.ldak", pheno=features),
+        expand(data_path + "/gwas/naive.{pheno1}.{pheno2}.cors", pheno1=features, pheno2=features),
+        data_path + "/gcov.tsv",
+        data_path + "/pheno_maxgcp.tsv",
+        data_path + "/pheno_maxgcp_individual.tsv",
+        expand(data_path + "/maxgcp_gwas/maxgcp.{pheno}.glm.linear", pheno=features),
+        data_path + "/pheno_maxh.tsv",
+        data_path + "/pheno_maxh_individual.tsv",
+        expand(data_path + "/maxh_gwas/maxh.{pheno}.glm.linear", pheno=features)
+        
+        
+        
+# Suppose we use pheno_0 as the initial phenotype
+# Subsample data to see the performance of MaxGCP under different sample sizes
+rule pick_initial_phenotypes:
+    input:
+        data_path + "/phenotypes.tsv"
+    output:
+        data_path + "/subsampled_phenotypes.tsv"
+    run:
+        phenotypes = pl.read_csv(input[0], separator="\t",has_header=True)
+        case_df = phenotypes.filter(pl.col("pheno_0") <= -1)
+        control_df = phenotypes.filter(pl.col("pheno_0") > -1).sample(n=len(case_df), seed=0)
+        subsample_df = pl.concat([case_df, control_df])
+        subsample_df.write_csv(output[0])
+        
+rule quality_control:
+    input:
+        geno = multiext(geno_path, ".pgen", ".psam", ".pvar")
+    output:
+        qc_path + "/filtered_kpg.pgen",
+        qc_path + "/filtered_kpg.psam",
+        qc_path + "/filtered_kpg.pvar"
+    params:
+        geno_prefix = geno_path,
+        out_prefix = qc_path + "/filtered_kpg"
+        plink = plink_path + "/plink2"
+    shell:
+        """
+        {params.plink} --pfile {params.geno_prefix} --maf 0.01 \
+        --mind 0.05 \
+        --geno 0.05 \
+        --hwe 1e-6 \
+        --snps-only \
+        --make-pgen \
+        --out {params.out_prefix}
+        """
+
+rule gwas_naive:
+    input:
+        pheno = data_path + "/phenotypes.tsv",
+        covar = data_path + "/covar.tsv",
+        geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar")
+    output:
+        expand(data_path + "/gwas/naive.{pheno}.glm.linear", pheno=features)
+    params:
+        geno_prefix = qc_path + "/filtered_kpg",
+        output_prefix = data_path + "/gwas/naive"
+        plink = plink_path + "/plink2"
+    threads: 55
+    shell:
+        """
+        {params.plink} --pfile {params.geno_prefix} --pheno {input.pheno} \
+        --covar {input.covar} --glm hide-covar --threads {threads} \
+        --out {params.output_prefix}
+        """       
+rule pca_rscript:
+    input:
+        pheno = data_path + "/phenotypes.tsv"
+    output:
+        pca_output = data_path + "/pca_gwas/pheno_pc.tsv",
+        pca_loading = data_path + "/pca_gwas/pca_loadings.tsv",
+       
+    shell:
+        """
+        Rscript documents/tlab/Rfiles/PCA.R {input.pheno} {output.pca_output} {output.pca_loading} 
+        """
+
+rule pca_gwas:
+    input:
+        pheno = data_path + "/pca_gwas/pheno_pc.tsv",
+        covar = data_path + "/covar.tsv",
+        geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar"),
+    output:
+        expand(data_path + "/pca_gwas/pca.{PC}.glm.linear", PC=PCs)
+    params:
+        geno_prefix = qc_path + "/filtered_kpg",
+        output_prefix = data_path + "/pca_gwas/pca"
+        plink = plink_path + "/plink2"
+    threads: 55
+    shell:
+        """
+        {params.plink} --pfile {params.geno_prefix} --pheno {input.pheno} \
+        --covar {input.covar} --glm hide-covar --threads {threads} \
+        --out {params.output_prefix}
+        """
+
+        
+        
+        
+# Format the GWAS results for SumHer
+
+
+# Remove the influence of covariates to isolate the covariance between phenotypes
+rule compute_phenotypic_covariance:
+    input:
+        pheno = data_path + "/phenotypes.tsv",
+        covar = data_path + "/covar.tsv"
+    output:
+        full = data_path + "/pcov/naive_full.tsv"
+    run:
+        pheno_df = pl.read_csv(input[0], separator="\t", has_header=True)
+        covar_df = pl.read_csv(input[1], separator="\t", has_header=True)
+        covariates = covar_df.drop("#IID").columns
+        merged_df = pheno_df.join(covar_df, on="#IID")
+        X = merged_df.select(covariates, const=1).to_numpy()
+        Y = merged_df.select(features).to_numpy()
+        beta = np.linalg.lstsq(X, Y, rcond=None)[0]
+        residuals = Y - X @ beta
+        cov = np.cov(residuals, rowvar=False)
+        (
+            pd.DataFrame(cov, index=features, columns=features)
+            .to_csv(output.full, sep="\t")
+        )
+
+rule compute_cov_sumher:
+    input:
+        data_path + "/gwas/naive.{features}.glm.linear"
+    output:
+        data_path + "/gwas/naive.{features}.glm.linear.ldak"
+    shell:
+        """
+        sumher_rs fmt -g {input} -o {output}
+        """
+        
+rule format_sumher:
+    input:
+        gwas = data_path + "/gwas/naive.{features}.glm.linear",
+        ld = data_path + "/gwas/naive.{features}.glm.linear.ldak"
+    output:
+        data_path + "/gwas/naive.{features}.formatted.glm.linear.ldak"
+    run:
+        df = pd.read_csv(input[0], delim_whitespace=True)
+        df['Predictor'] = df['#CHROM'].astype(str) + ':' + df['POS'].astype(str)
+        df=df[["Predictor","ID"]]
+        df1 = pd.read_csv(input[1], delim_whitespace=True)
+        df1['ID'] = df1['Predictor']
+        df1 = df1.drop(columns=['Predictor'])
+        df2 = pd.merge(df, df1, on='ID')
+        df2 = df2.drop(columns=['ID'])
+        df2.to_csv(output[0], sep="\t", index=False)
+        
+rule compute_genetic_correlation:
+    input:
+        pheno1=data_path + "/gwas/naive.{pheno1}.formatted.glm.linear.ldak",
+        pheno2=data_path + "/gwas/naive.{pheno2}.formatted.glm.linear.ldak"
+    output:
+        data_path + "/gwas/naive.{pheno1}.{pheno2}.cors"
+    threads: 1
+    params:
+        output_prefix=data_path + "/gwas/naive.{pheno1}.{pheno2}"
+    shell:
+        """
+        documents/tlab/ldak5.2.mac \
+        --summary {input.pheno1} \
+        --summary2 {input.pheno2} \
+        --sum-cors {params.output_prefix} \
+        --check-sums NO --cutoff 0.01 \
+        --tagfile documents/tlab/sumher/ldak.thin.hapmap.gbr.tagging
+        """
+
+rule compute_covariance_matrix:
+    input:
+        cors_files=collect(data_path + "/gwas/naive.{pheno1}.{pheno2}.cors", pheno1=features, pheno2=features)
+    output:
+        data_path + "/gcov.tsv"
+    run:
+        cov_matrix = pd.DataFrame(index=features, columns=features)
+        for path in input.cors_files:
+            filename = os.path.basename(path)
+            pheno1, pheno2 = filename.split('.')[1:3]
+            df = pd.read_csv(path, delim_whitespace=True)
+            coher_value = df.loc[df['Component'] == 'Coher_All', 'Value'].values
+
+            if len(coher_value) > 0:
+                cov_matrix.loc[pheno1, pheno2] = coher_value[0]
+                cov_matrix.loc[pheno2, pheno1] = coher_value[0]
+
+        cov_matrix.to_csv(output[0])
+
+rule maxgcp:
+    input:
+        pheno = data_path + "/phenotypes.tsv",
+        pcov = data_path + "/pcov/naive_full.tsv",
+        gcov = data_path + "/gcov.tsv"
+    output:
+        pheno_maxgcp = data_path + "/pheno_maxgcp.tsv",
+        pheno_new= data_path + "/pheno_maxgcp_individual.tsv"
+    run:
+        phenotypic_cov_mat = pd.read_csv(input.pcov, sep='\t', header=0, index_col=0)
+        genetic_cov_mat = pd.read_csv(input.gcov, sep=',', header=0, index_col=0)
+        feature_phenotypes_df = pd.read_csv(input.pheno, sep='\t', header=0, index_col=0)
+        IDs = feature_phenotypes_df.index
+        feature_phenotypes = feature_phenotypes_df.values
+        
+        phenotypic_cov_mat = phenotypic_cov_mat.to_numpy()
+        genetic_cov_mat = genetic_cov_mat.to_numpy()
+        
+        maxgcp_phenotypes_all = []
+        for i in range(genetic_cov_mat.shape[0]):
+            genetic_cov_vec = genetic_cov_mat[i, :]
+            w = maxgcp.fit_coheritability(genetic_cov_vec, phenotypic_cov_mat)
+            maxgcp_phenotypes_all.append(w)
+            
+        maxgcp_phenotypes_all = np.array(maxgcp_phenotypes_all)
+        pheno_for_individuals = feature_phenotypes @ maxgcp_phenotypes_all
+        
+        weight_indices = [f'pheno_{i}' for i in range(maxgcp_phenotypes_all.shape[0])]
+        maxgcp_phenotypes_df = pd.DataFrame(maxgcp_phenotypes_all, index=weight_indices)
+        maxgcp_phenotypes_df.to_csv(output.pheno_maxgcp, sep='\t', header=weight_indices, index=True)
+        pheno_for_individuals = pd.DataFrame(pheno_for_individuals, index=IDs)
+        pheno_for_individuals.to_csv(output.pheno_new, sep='\t', header=weight_indices, index=True)
+
+rule maxgcp_gwas:
+    input:
+        pheno = data_path + "/pheno_maxgcp_individual.tsv",
+        covar = data_path + "/covar.tsv",
+        geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar")
+    output:
+        expand(data_path + "/maxgcp_gwas/maxgcp.{pheno}.glm.linear", pheno=features)
+    params:
+        geno_prefix = qc_path + "/filtered_kpg",
+        output_prefix = data_path + "/maxgcp_gwas/maxgcp"
+        plink = plink_path + "/plink2"
+    threads: 55
+    shell:
+        """
+        {params.plink} --pfile {params.geno_prefix} --pheno {input.pheno} \
+        --covar {input.covar} --glm hide-covar --threads {threads} \
+        --out {params.output_prefix}
+        """
+
+rule maxh:
+    input:
+        pheno = data_path + "/phenotypes.tsv",
+        pcov = data_path + "/pcov/naive_full.tsv",
+        gcov = data_path + "/gcov.tsv"
+    output:
+        pheno_maxh = data_path + "/pheno_maxh.tsv",
+        pheno_new= data_path + "/pheno_maxh_individual.tsv"
+    run:
+        phenotypic_cov_mat = pd.read_csv(input.pcov, sep='\t', header=0, index_col=0)
+        genetic_cov_mat = pd.read_csv(input.gcov, sep=',', header=0, index_col=0)
+        feature_phenotypes_df = pd.read_csv(input.pheno, sep='\t', header=0, index_col=0)
+        IDs = feature_phenotypes_df.index
+        feature_phenotypes = feature_phenotypes_df.values
+        
+        phenotypic_cov_mat = phenotypic_cov_mat.to_numpy()
+        genetic_cov_mat = genetic_cov_mat.to_numpy()
+        
+        weight_indices = [f'pheno_{i}' for i in range(phenotypic_cov_mat.shape[0])]
+        weights = maxgcp.fit_heritability(genetic_cov_mat, phenotypic_cov_mat)
+        weights = np.real(weights)
+        maxh_pheno = feature_phenotypes @ weights
+        weights = pd.DataFrame(weights, index=weight_indices)
+        weights.to_csv(output.pheno_maxh, sep='\t', header=weight_indices, index=True)
+        maxh_pheno = pd.DataFrame(maxh_pheno, index=IDs)
+        maxh_pheno.to_csv(output.pheno_new, sep='\t', header=weight_indices, index=True)
+
+
+rule maxh_gwas:
+    input:
+        pheno = data_path + "/pheno_maxh_individual.tsv",
+        covar = data_path + "/covar.tsv",
+        geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar")
+    output:
+        expand(data_path + "/maxh_gwas/maxh.{pheno}.glm.linear", pheno=features)
+    params:
+        geno_prefix = qc_path + "/filtered_kpg",
+        output_prefix = data_path + "/maxh_gwas/maxh"
+        plink = plink_path + "/plink2"
+    threads: 55
+    shell:
+        """
+        {params.plink} --pfile {params.geno_prefix} --pheno {input.pheno} \
+        --covar {input.covar} --glm hide-covar --threads {threads} \
+        --out {params.output_prefix}
+        """
