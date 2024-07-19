@@ -42,11 +42,11 @@ rule all:
         expand(data_path + "/maxgcp_gwas/maxgcp.{pheno}.glm.linear", pheno=features),
         data_path + "/pheno_maxh.tsv",
         data_path + "/pheno_maxh_individual.tsv",
-        expand(data_path + "/maxh_gwas/maxh.{pheno}.glm.linear", pheno=features),
+        data_path + "/maxh_gwas/maxh.pheno.glm.linear",
         expand(data_path + "/prs/naive_prs.{pheno}.sscore", pheno=features),
         expand(data_path + "/prs/pca_prs.{PC}.sscore", PC=PCs),
         expand(data_path + "/prs/maxgcp_prs.{pheno}.sscore", pheno=features),
-        expand(data_path + "/prs/maxh_prs.{pheno}.sscore", pheno=features),
+        data_path + "/prs/maxh_prs.sscore",
         data_path + "/prs/prs_cov/naiveprs_covariate.tsv",
         data_path + "/prs/prs_cov/pcaprs_covariate.tsv",
         data_path + "/prs/prs_cov/maxgcprs_covariate.tsv",
@@ -306,11 +306,12 @@ rule maxh:
         weight_indices = [f'pheno_{i}' for i in range(phenotypic_cov_mat.shape[0])]
         weights = maxgcp.fit_heritability(genetic_cov_mat, phenotypic_cov_mat)
         weights = np.real(weights)
-        maxh_pheno = feature_phenotypes @ weights
+        maxh_pheno = feature_phenotypes @ weights[0]
         weights = pd.DataFrame(weights, index=weight_indices)
         weights.to_csv(output.pheno_maxh, sep='\t', header=weight_indices, index=True)
         maxh_pheno = pd.DataFrame(maxh_pheno, index=IDs)
-        maxh_pheno.to_csv(output.pheno_new, sep='\t', header=weight_indices, index=True)
+        maxh_pheno.columns = ["pheno"]
+        maxh_pheno.to_csv(output.pheno_new, sep='\t', header=True, index=True)
 
 
 rule maxh_gwas:
@@ -319,17 +320,17 @@ rule maxh_gwas:
         covar = data_path + "/covar.tsv",
         geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar")
     output:
-        expand(data_path + "/maxh_gwas/maxh.{pheno}.glm.linear", pheno=features)
+        data_path + "/maxh_gwas/maxh.pheno.glm.linear"
     params:
         geno_prefix = qc_path + "/filtered_kpg",
-        output_prefix = data_path + "/maxh_gwas/maxh",
+        out_prefix = data_path + "/maxh_gwas/maxh",
         plink = plink_path + "/plink2"
     threads: 55
     shell:
         """
         {params.plink} --pfile {params.geno_prefix} --pheno {input.pheno} \
         --covar {input.covar} --glm hide-covar --threads {threads} \
-        --out {params.output_prefix}
+        --out {params.out_prefix}
         """
 
 rule compute_prs_naive:
@@ -383,17 +384,17 @@ rule compute_prs_maxgcp:
 rule compute_prs_maxh:
     input:
         geno = multiext(qc_path + "/filtered_kpg", ".pgen", ".psam", ".pvar"),
-        gwas_maxh = data_path + "/maxh_gwas/maxh.{features}.glm.linear"
+        gwas_maxh = data_path + "/maxh_gwas/maxh.pheno.glm.linear"
     output:
-        data_path + "/prs/maxh_prs.{features}.sscore"
+        data_path + "/prs/maxh_prs.sscore"
     params:
         geno_prefix = qc_path + "/filtered_kpg",
-        output_prefix = data_path + "/prs/maxh_prs.{features}" ,
-        plink = plink_path + "/plink2"
+        plink = plink_path + "/plink2",
+        out_prefix = data_path + "/prs/maxh_prs"
     shell:
         """
-        {params.plink} --pfile {params.geno_prefix}  \
-        --score {input.gwas_maxh} 3 5 11 header cols=+scoresums --out {params.output_prefix}
+        {params.plink} --pfile {params.geno_prefix} \
+        --score {input.gwas_maxh} 3 5 11 header cols=+scoresums --out {params.out_prefix}
         """
         
 rule merge_covariates:
@@ -402,7 +403,7 @@ rule merge_covariates:
         prs_naive = expand(data_path + "/prs/naive_prs.{pheno}.sscore", pheno=features),
         prs_pca = expand(data_path + "/prs/pca_prs.{PC}.sscore", PC=PCs),
         prs_maxgcp = expand(data_path + "/prs/maxgcp_prs.{pheno}.sscore", pheno=features),
-        prs_maxh = expand(data_path + "/prs/maxh_prs.{pheno}.sscore", pheno=features)
+        prs_maxh = data_path + "/prs/maxh_prs.sscore"
     output:
         cov_prs_naive = data_path + "/prs/prs_cov/naiveprs_covariate.tsv",
         cov_prs_pca = data_path + "/prs/prs_cov/pcaprs_covariate.tsv",
@@ -414,7 +415,7 @@ rule merge_covariates:
         prs_naive_files = [f"{prs_path}/naive_prs.{pheno}.sscore" for pheno in features]
         prs_pca_files = [f"{prs_path}/pca_prs.{PC}.sscore" for PC in PCs]
         prs_maxgcp_files = [f"{prs_path}/maxgcp_prs.{pheno}.sscore" for pheno in features]
-        prs_maxh_files = [f"{prs_path}/maxh_prs.{pheno}.sscore" for pheno in features]
+        prs_maxh_file = f"{prs_path}/maxh_prs.sscore"
 
         def merge_prs(covar_df, prs_files, prefix):
             for i, prs_file in enumerate(prs_files):
@@ -431,7 +432,9 @@ rule merge_covariates:
         prs_maxgcp_df = merge_prs(covar_df.copy(), prs_maxgcp_files, 'PRS_maxgcp')
         prs_maxgcp_df.to_csv(output.cov_prs_maxgcp, sep='\t', index=False)
         
-        prs_maxh_df = merge_prs(covar_df.copy(), prs_maxh_files, 'PRS_maxh')
+        prs_maxh_df = pd.read_csv(prs_maxh_file, sep='\t')
+        prs_maxh_df = prs_maxh_df[['#IID', 'SCORE1_SUM']].rename(columns={'SCORE1_SUM': 'PRS_maxh'})
+        prs_maxh_df = pd.merge(covar_df, prs_maxh_df, left_on='#IID', right_on='#IID', how='left')
         prs_maxh_df.to_csv(output.cov_prs_maxh, sep='\t', index=False)
 
         
