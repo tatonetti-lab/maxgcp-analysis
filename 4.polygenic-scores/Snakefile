@@ -346,7 +346,7 @@ rule compute_prs_naive:
     shell:
         """
         {params.plink} --pfile {params.geno_prefix}  \
-        --score {input.gwas_naive} 3 5 11 header cols=+scoresums --out {params.output_prefix}
+        --score {input.gwas_naive} 3 5 12 header cols=+scoresums --out {params.output_prefix}
         """
 
 rule compute_prs_pca:
@@ -362,7 +362,7 @@ rule compute_prs_pca:
     shell:
         """
         {params.plink} --pfile {params.geno_prefix}  \
-        --score {input.gwas_pca} 3 5 11 header cols=+scoresums --out {params.output_prefix}
+        --score {input.gwas_pca} 3 5 12 header cols=+scoresums --out {params.output_prefix}
         """
 
 rule compute_prs_maxgcp:
@@ -378,7 +378,7 @@ rule compute_prs_maxgcp:
     shell:
         """
         {params.plink} --pfile {params.geno_prefix}  \
-        --score {input.gwas_maxgcp} 3 5 11 header cols=+scoresums --out {params.output_prefix}
+        --score {input.gwas_maxgcp} 3 5 12 header cols=+scoresums --out {params.output_prefix}
         """
 
 rule compute_prs_maxh:
@@ -394,7 +394,7 @@ rule compute_prs_maxh:
     shell:
         """
         {params.plink} --pfile {params.geno_prefix} \
-        --score {input.gwas_maxh} 3 5 11 header cols=+scoresums --out {params.out_prefix}
+        --score {input.gwas_maxh} 3 5 12 header cols=+scoresums --out {params.out_prefix}
         """
         
 rule merge_covariates:
@@ -423,10 +423,18 @@ rule merge_covariates:
                 prs_df = prs_df[['#IID', 'SCORE1_SUM']].rename(columns={'SCORE1_SUM': f'{prefix}_pheno_{i}'})
                 covar_df = pd.merge(covar_df, prs_df, left_on='#IID', right_on='#IID', how='left')
             return covar_df
+            
+        def merge_prs_pc(covar_df, prs_files, prefix):
+            for i, prs_file in enumerate(prs_files):
+                prs_df = pd.read_csv(prs_file, sep='\t')
+                prs_df = prs_df[['#IID', 'SCORE1_SUM']].rename(columns={'SCORE1_SUM': f'{prefix}_PC_{i}'})
+                covar_df = pd.merge(covar_df, prs_df, left_on='#IID', right_on='#IID', how='left')
+            return covar_df
+            
         prs_naive_df = merge_prs(covar_df.copy(), prs_naive_files, 'PRS_naive')
         prs_naive_df.to_csv(output.cov_prs_naive, sep='\t', index=False)
         
-        prs_pca_df = merge_prs(covar_df.copy(), prs_pca_files, 'PRS_pca')
+        prs_pca_df = merge_prs_pc(covar_df.copy(), prs_pca_files, 'PRS_pca')
         prs_pca_df.to_csv(output.cov_prs_pca, sep='\t', index=False)
         
         prs_maxgcp_df = merge_prs(covar_df.copy(), prs_maxgcp_files, 'PRS_maxgcp')
